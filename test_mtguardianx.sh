@@ -114,6 +114,15 @@ case "${MTCORE_MODE:-clean}" in
     hang)
         while :; do sleep 1; done
         ;;
+    relaunch)
+        # Real MTCore self-restart: spawn "MTCore --wait4pid <me>" with no
+        # profile argument and no matchable cscdat, then exit cleanly.
+        MTCORE_MODE="${MTCORE_NEXT_MODE:-hang}" MTCORE_NO_CSCDAT=1 \
+            "$0" --no-update --wait4pid "$$" </dev/null >/dev/null 2>&1 &
+        sleep 1
+        rm -f -- "${cscdat}"
+        exit 0
+        ;;
     *)
         exit 99
         ;;
@@ -536,6 +545,92 @@ else
     fail "core console routing wrong"
     sed 's/^/    | /' "${WORK}/console-1.log" "${WORK}/console-0.log" 2>/dev/null || true
 fi
+
+fixture_pids() {
+    local entry
+    for entry in /proc/[0-9]*/cmdline; do
+        tr '\0' ' ' 2>/dev/null < "${entry}" | grep -q "^bash ${WORK}/MTCore \|^${WORK}/MTCore " || continue
+        entry="${entry#/proc/}"; printf '%s\n' "${entry%/cmdline}"
+    done
+}
+kill_fixtures() { fixture_pids | xargs -r kill -9 2>/dev/null || true; }
+relaunched_pid() { fixture_pids | while read -r p; do tr '\0' ' ' < "/proc/${p}/cmdline" 2>/dev/null | grep -q -- '--wait4pid' && printf '%s' "${p}"; done; }
+
+printf 'Test 20: guardian re-attaches to a self-relaunched core and restarts it after kill\n'
+cleanup_test_cscdat; kill_fixtures
+MTCORE_MODE=relaunch MTCORE_START_LOG="${WORK}/starts-relaunch.log" bash "${MTGX}" --config "${WORK}/test.conf" 2>"${WORK}/relaunch.log" &
+gx=$!
+GUARDIAN_PIDS+=( "${gx}" )
+sleep 5
+succ="$(relaunched_pid | head -c 20)"
+running="$(fixture_pids | wc -l | tr -d ' ')"
+if [[ -n "${succ}" ]] && grep -q "Started monitoring MTCore pid \[${succ}\]" "${WORK}/relaunch.log" && (( running == 1 )); then
+    pass "attached to relaunched pid ${succ}, single core running"
+else
+    fail "relaunched core not attached (succ=${succ:-none} running=${running})"
+    sed 's/^/    | /' "${WORK}/relaunch.log"
+fi
+starts_before="$(wc -l < "${WORK}/starts-relaunch.log")"
+[[ -n "${succ}" ]] && kill -9 "${succ}" 2>/dev/null
+sleep 5
+starts_after="$(wc -l < "${WORK}/starts-relaunch.log")"
+if grep -q "MTCore pid \[${succ}\] crashed" "${WORK}/relaunch.log" && (( starts_after > starts_before )); then
+    pass "killed relaunched core was detected and restarted"
+else
+    fail "killed relaunched core was not restarted (starts ${starts_before}->${starts_after})"
+    sed 's/^/    | /' "${WORK}/relaunch.log"
+fi
+
+printf 'Test 21: replacement guardian finds a relaunched core without its old PID\n'
+kill -TERM "${gx}" 2>/dev/null || true
+wait "${gx}" 2>/dev/null || true
+sleep 2
+starts_before="$(wc -l < "${WORK}/starts-relaunch.log")"
+succ="$(relaunched_pid | head -c 20)"
+MTCORE_MODE=clean MTCORE_START_LOG="${WORK}/starts-relaunch.log" bash "${MTGX}" --config "${WORK}/test.conf" 2>"${WORK}/relaunch2.log" &
+gx=$!
+GUARDIAN_PIDS+=( "${gx}" )
+sleep 3
+starts_after="$(wc -l < "${WORK}/starts-relaunch.log")"
+if [[ -n "${succ}" ]] && grep -q "Started monitoring MTCore pid \[${succ}\]" "${WORK}/relaunch2.log" && (( starts_after == starts_before )); then
+    pass "attached to relaunched pid ${succ} via inherited marker, no second core"
+else
+    fail "replacement guardian did not attach (succ=${succ:-none} starts ${starts_before}->${starts_after})"
+    sed 's/^/    | /' "${WORK}/relaunch2.log"
+fi
+kill -TERM "${gx}" 2>/dev/null || true
+wait "${gx}" 2>/dev/null || true
+kill_fixtures
+
+printf 'Test 22: external core relaunched by the user is followed by --wait4pid lineage\n'
+cleanup_test_cscdat
+MTCORE_MODE=clean MTCORE_START_LOG="${WORK}/starts-lineage-guardian.log" bash "${MTGX}" --config "${WORK}/test.conf" 2>"${WORK}/lineage.log" &
+gx=$!
+GUARDIAN_PIDS+=( "${gx}" )
+sleep 2
+: > "${WORK}/starts-lineage-guardian.log"
+MTCORE_MODE=hang MTCORE_START_LOG="${WORK}/starts-lineage-ext.log" "${WORK}/MTCore" --profile Test_Prof_V5 &
+disown
+sleep 3
+ext="$(sed -n 's/:hang$//p' "${WORK}/starts-lineage-ext.log")"
+# operator restarts it from the client: the core spawns its successor, then exits
+MTCORE_MODE=hang MTCORE_NO_CSCDAT=1 "${WORK}/MTCore" --no-update --wait4pid "${ext}" </dev/null >/dev/null 2>&1 &
+succ=$!
+disown
+sleep 1
+kill -9 "${ext}" 2>/dev/null
+sleep 4
+if grep -q "Started monitoring MTCore pid \[${ext}\]" "${WORK}/lineage.log" &&
+   grep -q "Started monitoring MTCore pid \[${succ}\]" "${WORK}/lineage.log" &&
+   [[ ! -s "${WORK}/starts-lineage-guardian.log" ]]; then
+    pass "followed ${ext} -> ${succ} without launching a second core"
+else
+    fail "lineage follow failed (ext=${ext} succ=${succ})"
+    sed 's/^/    | /' "${WORK}/lineage.log"
+fi
+kill -TERM "${gx}" 2>/dev/null || true
+wait "${gx}" 2>/dev/null || true
+kill_fixtures
 
 printf '\n'
 if (( FAIL == 0 )); then

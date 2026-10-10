@@ -924,17 +924,26 @@ find_core_pid_by_cmdline() {
         pid="${pid%/cmdline}"
         [[ "${pid}" =~ ^[0-9]+$ ]] || continue
         pid_is_running "${pid}" || continue
-        cmdline="$(tr '\0' ' ' < "${entry}" 2>/dev/null)" || continue
+        # 2>/dev/null first: the process may exit between the glob and the read.
+        cmdline="$(tr '\0' ' ' 2>/dev/null < "${entry}")" || continue
         case "${cmdline}" in
             *MTCore*) ;;
             *) continue ;;
         esac
         case " ${cmdline} " in
-            *" --profile-name ${target} "*)
+            *" --profile-name ${target} "*|*" --profile ${target} "*)
                 printf '%s' "${pid}"
                 return 0
                 ;;
         esac
+        # A self-relaunched core (--wait4pid <old>) carries no profile argument:
+        # it is ours if it succeeds the last supervised core, or if it inherited
+        # the profile marker from a core this guardian launched.
+        if [[ "${LAST_CORE_PID:-0}" != "0" && " ${cmdline} " == *" --wait4pid ${LAST_CORE_PID} "* ]] ||
+           tr '\0' '\n' 2>/dev/null < "/proc/${pid}/environ" | grep -qxF "MTGX_CORE_PROFILE=${target}"; then
+            printf '%s' "${pid}"
+            return 0
+        fi
     done
     return 1
 }
@@ -1047,6 +1056,12 @@ classify_child_exit() {
 
     cleanup_cscdat "${pid}"
 
+    # Self-relaunch (--wait4pid): the old pid exits while its successor runs.
+    if find_core_pid_for_profile "${MT_CORE_PROFILE}" >/dev/null; then
+        LAST_OUTCOME="clean"
+        return 0
+    fi
+
     if [[ "${rc}" -eq 139 ]]; then
         LAST_OUTCOME="sigsegv"
     else
@@ -1128,6 +1143,8 @@ launch_and_supervise_child() {
         # Under systemd the inherited stdout/stderr is the journal, which rsyslog
         # copies unrotated into /var/log/syslog. MTCore writes its own log files.
         [[ -n "${JOURNAL_STREAM:-}" ]] && exec >/dev/null 2>&1
+        # Inherited by --wait4pid self-relaunches, which drop --profile-name.
+        export MTGX_CORE_PROFILE="${MT_CORE_PROFILE}"
         exec "${MT_CORE_DIR}/MTCore" "${CORE_ARGS[@]}"
     ) &
 
@@ -1176,10 +1193,12 @@ wait_for_external_core() {
 monitor_external_core() {
     local pid="$1"
     local file="${TMP_DIR}/${pid}.cscdat"
+    local had_cscdat=0
 
     CURRENT_STATE="monitoring"
     write_status "monitoring" "${CURRENT_STATE}"
     while pid_is_running "${pid}"; do
+        [[ -e "${file}" ]] && had_cscdat=1
         if consume_restart_request; then
             notify_event "*Notice: Local restart request accepted for monitored MTCore pid [${pid}] on [${MT_CORE_SERVER_NAME}] at [$(now)]" "core_restart_requested" "pid=${pid}" "mode=monitor"
             kill -TERM "${pid}" 2>/dev/null || true
@@ -1197,7 +1216,13 @@ monitor_external_core() {
         return 0
     fi
 
-    if [[ -e "${file}" ]]; then
+    # Self-relaunch (--wait4pid): the old pid exits while its successor runs.
+    if find_core_pid_for_profile "${MT_CORE_PROFILE}" >/dev/null; then
+        cleanup_cscdat "${pid}"
+        LAST_OUTCOME="clean"
+    # ponytail: a core that never wrote a cscdat cannot signal a clean stop, so
+    # its disappearance counts as a crash (restart over silently staying down).
+    elif [[ -e "${file}" ]] || (( had_cscdat == 0 )); then
         cleanup_cscdat "${pid}"
         LAST_OUTCOME="crash"
         write_crash_snapshot "${LAST_OUTCOME}" "${pid}" "external"
@@ -1252,6 +1277,9 @@ run_supervisor() {
     fi
 
     while (( SHUTDOWN_REQUESTED == 0 )); do
+        if [[ "${mode}" == "launch" ]] && find_core_pid_for_profile "${MT_CORE_PROFILE}" >/dev/null; then
+            mode="monitor"
+        fi
         if [[ "${mode}" == "launch" ]]; then
             launch_and_supervise_child
             outcome="${LAST_OUTCOME}"
